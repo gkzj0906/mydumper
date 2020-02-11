@@ -1,0 +1,38 @@
+# compile mydumper with shared link for all libraries
+gcc -I/usr/include/mysql \
+-I/usr/lib64/glib-2.0/include \
+-I/usr/include/glib-2.0 \
+-Wall -Wno-deprecated-declarations -Wunused -Wwrite-strings -Wno-strict-aliasing -Wextra -Wshadow -Werror -O3 -g \
+-o mydumper mydumper.c server_detect.c g_unix_signal.c connection.c getPassword.c \
+/usr/lib64/mysql/libmysqlclient.so \
+/usr/lib64/libssl.so \
+/usr/lib64/libcrypto.so \
+/usr/lib64/libpthread.so \
+/usr/lib64/libz.so \
+/usr/lib64/libm.so \
+/usr/lib64/librt.so \
+/usr/lib64/libdl.so \
+/usr/lib64/libpcre.so \
+/usr/lib64/libglib-2.0.so \
+/usr/lib64/libgthread-2.0.so \
+/usr/lib64/libc.so
+
+# compile mydumper with static link for special libraries
+gcc -I/usr/include/mysql \
+-I/usr/lib64/glib-2.0/include \
+-I/usr/include/glib-2.0 \
+-Wall -Wno-deprecated-declarations -Wunused -Wwrite-strings -Wno-strict-aliasing -Wextra -Wshadow -Werror -O3 -g \
+-o mydumper mydumper.c server_detect.c g_unix_signal.c connection.c getPassword.c \
+lib_static/libmysqlclient.a \
+lib_static/libssl.a \
+lib_static/libcrypto.a \
+/usr/lib64/libpthread.so \
+lib_static/libz.a \
+/usr/lib64/libm.so \
+lib_static/librt.a \
+/usr/lib64/libdl.so \
+lib_static/libpcre.a \
+/usr/lib64/libglib-2.0.so \
+/usr/lib64/libgthread-2.0.so \
+/usr/lib64/libc.so \
+/usr/lib64/libstdc++.so.6

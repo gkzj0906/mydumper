@@ -12,7 +12,7 @@
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-        Authors: 	Domas Mituzas, Facebook ( domas at fb dot com )
+        Authors:    Domas Mituzas, Facebook ( domas at fb dot com )
                     Mark Leith, Oracle Corporation (mark dot leith at oracle dot com)
                     Andrew Hutchings, SkySQL (andrew at skysql dot com)
                     Max Bubenick, Percona RDBA (max dot bubenick at percona dot com)
@@ -51,6 +51,7 @@
 #include "g_unix_signal.h"
 #include <math.h>
 #include "getPassword.h"
+#include <regex.h>
 
 char *regexstring = NULL;
 
@@ -94,6 +95,10 @@ GSequence *tables_skiplist = NULL;
 gchar *tables_skiplist_file = NULL;
 char **tables = NULL;
 GList *no_updated_tables = NULL;
+
+gchar *ignore_table_columns_list = NULL;
+//map: string->GSlist[string]
+GHashTable *ignore_table_columns_map = NULL;
 
 #ifdef WITH_BINLOG
 gboolean need_binlogs = FALSE;
@@ -233,6 +238,8 @@ static GOptionEntry entries[] = {
      "Transactional consistency only", NULL},
     {"complete-insert", 0, 0, G_OPTION_ARG_NONE, &complete_insert,
      "Use complete INSERT statements that include column names", NULL},
+	{"ignore-tables-columns", 0, 0, G_OPTION_ARG_STRING, &ignore_table_columns_list,
+	 "Ignore columns when dump data of the specific table, example: tableX_*=c1,c2;tableY=c2", NULL},
     {"tidb-snapshot", 'z', 0, G_OPTION_ARG_STRING, &tidb_snapshot,
      "Snapshot to use for TiDB", NULL},
     {NULL, 0, 0, G_OPTION_ARG_NONE, NULL, NULL, NULL}};
@@ -274,6 +281,14 @@ gboolean check_regex(char *database, char *table);
 gboolean check_skiplist(char *database, char *table);
 int tables_skiplist_cmp(gconstpointer a, gconstpointer b, gpointer user_data);
 void read_tables_skiplist(const gchar *filename);
+
+GHashTable* parse_semicolon_seperated_kv_strs_to_map_with_lowercase(gchar* semicolon_seperated_kv_strs);
+void append_k_vGSList_string(gpointer hash_key, gpointer hash_value, gpointer to_str_buf);
+GString* to_GString_with_hash_k_GSList(GHashTable *k_GSList_hash);
+gint gStrElementCaseCompareFunc(gconstpointer a, gconstpointer b);
+gboolean gStrKeyRegexMatchedFunc(gpointer  k, gpointer v, gpointer user_data);
+GString *get_insertable_fields_withno_ignore_columns(MYSQL *conn, char *database, char *table);
+
 void no_log(const gchar *log_domain, GLogLevelFlags log_level,
             const gchar *message, gpointer user_data);
 void set_verbose(guint verbosity);
@@ -469,6 +484,142 @@ void read_tables_skiplist(const gchar *filename) {
   g_message("Omit list file contains %d tables to skip\n",
             g_sequence_get_length(tables_skiplist));
   return;
+}
+
+void str_key_destory_func(gpointer data)
+{
+  gchar *str_key = (gchar *)data;
+  g_free(str_key);
+}
+
+void gsList_value_destory_func(gpointer data)
+{
+  GSList *gsList_value = (GSList *)data;
+  g_slist_free(gsList_value);
+}
+
+/**
+ * return map: string key -> gsList[string]
+ * paramter string, example: "a=a1,A2,a3; B=b1,B2,B3"
+ * return map: a->[a1, a2, a3], b->[b1, b2, b3]
+ */
+GHashTable* parse_semicolon_seperated_kv_strs_to_map_with_lowercase(gchar* semicolon_seperated_kv_strs)
+{
+  GHashTable *parsed_kv_map = NULL;
+
+  gchar** kv_str_arr = g_strsplit(semicolon_seperated_kv_strs, ";", 0);
+  if (kv_str_arr)
+  {
+    parsed_kv_map = g_hash_table_new_full(g_str_hash, g_str_equal, str_key_destory_func, gsList_value_destory_func);
+    gchar** kv_str_arr_p = NULL;
+    for (kv_str_arr_p=kv_str_arr; *kv_str_arr_p; kv_str_arr_p++)
+    {
+      gchar** kv_pair_str = g_strsplit(*kv_str_arr_p, "=", 0);
+      if (kv_pair_str && g_strv_length(kv_pair_str)==2)
+      {
+        gchar* key_name = kv_pair_str[0];
+        gchar* csv_str = kv_pair_str[1];
+
+        GSList* vlist=NULL;
+        gchar** v_arr = g_strsplit(csv_str, ",", 0);
+        gchar** v_arr_p = NULL;
+        for(v_arr_p=v_arr; *v_arr_p; v_arr_p++)
+        {
+            gchar* s_value = g_strstrip(*v_arr_p);
+            vlist = g_slist_append(vlist, s_value);
+        }
+
+        g_hash_table_insert(parsed_kv_map,
+                        g_strstrip(g_ascii_strdown(key_name, strlen(key_name))), vlist);
+      }
+      else
+      {
+        g_warning("invalid key-value string '%s' and will be ignored!", *kv_str_arr_p);
+      }
+
+      g_strfreev(kv_pair_str);
+    }
+  }
+
+  g_strfreev(kv_str_arr);
+
+  return parsed_kv_map;
+}
+
+void append_k_vGSList_string(gpointer hash_key, gpointer hash_value, gpointer to_str_buf)
+{
+  gchar* k_str = (gchar *)hash_key;
+  GSList* v_list = (GSList *)hash_value;
+  GString* result = (GString *)to_str_buf;
+
+  g_string_append_printf(result, ", %s=", k_str);
+  g_string_append(result, "[");
+  gboolean isFirst = TRUE;
+  while(v_list)
+  {
+    if(isFirst)
+    {
+      isFirst = FALSE;
+    }
+    else
+    {
+      g_string_append(result, ",");
+    }
+
+    g_string_append(result, v_list->data);
+
+    v_list = v_list->next;
+  }
+
+  g_string_append(result, "]");
+}
+
+GString* to_GString_with_hash_k_GSList(GHashTable *k_GSList_hash)
+{
+  const gchar *prefix = ", ";
+
+  GString* to_str_buf = g_string_new("");
+  g_hash_table_foreach(k_GSList_hash, append_k_vGSList_string, to_str_buf);
+
+  if(g_str_has_prefix(to_str_buf->str, prefix))
+    g_string_erase(to_str_buf, 0, strlen(prefix));
+
+  g_string_prepend(to_str_buf, "{");
+  g_string_append(to_str_buf, "}");
+  return to_str_buf;
+}
+
+gint gStrElementCaseCompareFunc(gconstpointer a, gconstpointer b)
+{
+  gchar *a_str = (gchar *)a;
+  gchar *b_str = (gchar *)b;
+  return g_ascii_strcasecmp(a_str, b_str);
+}
+
+/**
+ * regex: only support pattern string which contains  char '*' as suffix
+ */
+gboolean gStrKeyRegexMatchedFunc(gpointer  k, gpointer v, gpointer user_data)
+{
+  if (!v) return FALSE;
+
+  gchar *pattern = (gchar *)k;
+  gchar *obj_str = (gchar *)user_data;
+
+  char *sub_str = strstr(pattern, "*");
+  if (sub_str && strlen(sub_str)!=1) return FALSE;
+
+  int ret=0;
+  regex_t reg;
+  regmatch_t pm[1];
+  ret = regcomp(&reg, pattern, REG_ICASE|REG_NOSUB);
+  if (ret) return FALSE;
+
+  ret = regexec(&reg, obj_str, 1, pm, 0);
+
+  regfree(&reg);
+
+  return !ret;
 }
 
 /* Write some stuff we know about snapshot, before it changes */
@@ -1233,6 +1384,15 @@ int main(int argc, char *argv[]) {
   if (tables_skiplist_file)
     read_tables_skiplist(tables_skiplist_file);
 
+  if (ignore_table_columns_list)
+  {
+    complete_insert=1;
+    ignore_table_columns_map = parse_semicolon_seperated_kv_strs_to_map_with_lowercase(ignore_table_columns_list);
+    GString *ignore_table_columns_map_string = to_GString_with_hash_k_GSList(ignore_table_columns_map);
+    g_message("ignore table columns map string: %s", ignore_table_columns_map_string->str);
+    g_string_free(ignore_table_columns_map_string, TRUE);
+  }
+
   if (daemon_mode) {
     GError *terror;
 #ifdef WITH_BINLOG
@@ -1277,6 +1437,8 @@ int main(int argc, char *argv[]) {
   g_free(output_directory);
   g_strfreev(ignore);
   g_strfreev(tables);
+
+  g_hash_table_destroy(ignore_table_columns_map);
 
   if (logoutfile) {
     fclose(logoutfile);
@@ -2112,8 +2274,51 @@ GString *get_insertable_fields(MYSQL *conn, char *database, char *table) {
       g_string_append(field_list, ",");
     }
 
-    g_string_append(field_list, row[0]);
+    g_string_append_printf(field_list, "`%s`", row[0]);
   }
+  mysql_free_result(res);
+
+  return field_list;
+}
+
+GString *get_insertable_fields_withno_ignore_columns(MYSQL *conn, char *database, char *table) {
+  MYSQL_RES *res = NULL;
+  MYSQL_ROW row;
+
+  GString *field_list = g_string_new("");
+
+  gchar *query =
+      g_strdup_printf("select COLUMN_NAME from information_schema.COLUMNS "
+                      "where TABLE_SCHEMA='%s' and TABLE_NAME='%s' and extra "
+                      "not like '%%GENERATED%%'",
+                      database, table);
+  mysql_query(conn, query);
+  g_free(query);
+
+  res = mysql_store_result(conn);
+
+  GSList* ignore_column_names_list = (GSList *)g_hash_table_find(ignore_table_columns_map, gStrKeyRegexMatchedFunc, table);
+  gboolean first = TRUE;
+  while ((row = mysql_fetch_row(res))) {
+    if(ignore_column_names_list)
+    {
+      GSList* foundColumn = g_slist_find_custom(ignore_column_names_list, row[0], gStrElementCaseCompareFunc);
+      if(foundColumn)
+      {
+        g_warning("table '%s' data will ignore column '%s'", table, row[0]);
+        continue;
+      }
+    }
+
+    if (first) {
+      first = FALSE;
+    } else {
+      g_string_append(field_list, ",");
+    }
+
+    g_string_append_printf(field_list, "`%s`", row[0]);
+  }
+
   mysql_free_result(res);
 
   return field_list;
@@ -3451,7 +3656,9 @@ guint64 dump_table_data(MYSQL *conn, FILE *file, char *database, char *table,
 
   GString *select_fields;
 
-  if (has_generated_fields) {
+  if (ignore_table_columns_map) {
+    select_fields = get_insertable_fields_withno_ignore_columns(conn, database, table);
+  } else if (has_generated_fields) {
     select_fields = get_insertable_fields(conn, database, table);
   } else {
     select_fields = g_string_new("*");
@@ -3463,6 +3670,7 @@ guint64 dump_table_data(MYSQL *conn, FILE *file, char *database, char *table,
       (detected_server == SERVER_TYPE_MYSQL) ? "/*!40001 SQL_NO_CACHE */" : "",
       select_fields->str, database, table, where ? "WHERE" : "",
       where ? where : "");
+  g_warning("select statement for dumping table data:  %s", query);
   g_string_free(select_fields, TRUE);
   if (mysql_query(conn, query) || !(result = mysql_use_result(conn))) {
     // ERROR 1146
